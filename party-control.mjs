@@ -1,4 +1,4 @@
-import {validProviderId,publicVideoURL,publicStreamURL,isLiveSource} from './public/xparty/providers.js';
+import {validProviderId,publicVideoURL,publicStreamURL,publicRadioURL,isLiveSource} from './public/xparty/providers.js';
 import {normalizeCompanionSource} from './public/xparty/companion-providers.js';
 import {randomUUID} from 'node:crypto';
 export const MODES=['HOST_APPROVAL','HOST_ONLY','SHARED_CONTROL'];
@@ -18,7 +18,7 @@ export function createPartyControl({online,send,state,execute,now=Date.now,reque
   finish(r,q,'EXECUTED','Approved action dispatched.');
  }
  function request(r,p,action){if((r.mode||'HOST_APPROVAL')==='HOST_ONLY'){send(p.ws,{type:'error',message:'Host Only mode: playback is controlled by the host.'});return;}
-  if(action.type==='source'){const companion=normalizeCompanionSource(action.source);if(companion)action={...action,source:companion};else if(!validProviderId(action.source?.type,action.source?.videoId)&&!(action.source?.type==='direct'&&publicVideoURL(action.source.url))&&!(action.source?.type==='iptv'&&publicStreamURL(action.source.url))){send(p.ws,{type:'error',message:'Choose a supported video link. Local files must be shared by the host.'});return;}}
+  if(action.type==='source'){const companion=normalizeCompanionSource(action.source);if(companion)action={...action,source:companion};else if(!validProviderId(action.source?.type,action.source?.videoId)&&!(action.source?.type==='direct'&&publicVideoURL(action.source.url))&&!(action.source?.type==='iptv'&&(action.source.radio===true?publicRadioURL(action.source.url):publicStreamURL(action.source.url)))){send(p.ws,{type:'error',message:'Choose a supported video link. Local files must be shared by the host.'});return;}}
   if(action.type==='party-mode'&&!MODES.includes(action.mode))return;
   r.requests??=[];const fingerprint=JSON.stringify(action);const duplicate=r.requests.find(q=>q.by===p.id&&PENDING.includes(q.status)&&JSON.stringify(q.action)===fingerprint);if(duplicate){notify(r,duplicate);return;}
   if(r.requests.filter(q=>q.by===p.id&&now()-q.createdAt<10000).length>=3||r.requests.filter(q=>PENDING.includes(q.status)).length>=30){send(p.ws,{type:'error',message:'Please wait before sending another request.'});return;}

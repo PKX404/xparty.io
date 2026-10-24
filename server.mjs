@@ -10,6 +10,7 @@ import {directorySettings,updateDirectory,publicRooms} from './room-directory.mj
 import {skipState,configureSkip,resetSkipVotes} from './skip-voting.mjs';
 import {createCallSeats} from './call-seats.mjs';
 import {MAX_VIDEO_BYTES,MAX_CALL_SEATS,validRoomCapacity,roomIsFull,normalizeRoomCode,validRoomCode} from './public/xparty/limits.js';
+import {createRoomInteractions} from './room-interactions.mjs';
 import {createRoomSocial} from './room-social.mjs';
 import http from 'node:http';
 import {readFile,mkdtemp,rm,open} from 'node:fs/promises';
@@ -45,10 +46,11 @@ export function createXparty(options={}) {
  function send(ws,obj){if(ws?.readyState===WebSocket.OPEN){if(ws.bufferedAmount>1024*1024)return ws.close(1013,'Slow connection');const payload=JSON.stringify(obj);owner.observeOutput(Buffer.byteLength(payload));ws.send(payload);}}
  const online=p=>p.ws?.readyState===WebSocket.OPEN;
  const social=createRoomSocial({send,broadcast,online,rate,persist});
+ const interactions=createRoomInteractions({send,state,choose,online,rate});
  const callSeats=createCallSeats({online,send,state,rate});
  const attachments=createAttachmentStore({online:p=>online(p)&&clients.get(p.token)===p&&rooms.has(p.code)});
  function broadcast(r,obj){for(const p of r.people.values())send(p.ws,obj);}
- function snapshot(r){return {code:r.code,...directorySettings(r),skipVoting:skipState(r,online),hostId:r.hostId,ownerId:r.ownerId||r.hostId,...partyState(r),hostReconnecting:!online(r.people.get(r.hostId)||{}),bufferTogether:r.bufferTogether!==false,pttEnabled:!!r.pttEnabled,theme:r.theme||null,guestThemes:!!r.guestThemes,autoplay:queueOrder(r)==='fifo',queueOrder:queueOrder(r),autoAdvance:r.autoAdvance!==false,capacity:r.capacity,locked:r.locked,source:r.source,sourceLikes:r.sourceLikes||[],playback:r.playback,queue:r.queue||[],people:[...r.people.values()].map(p=>({id:p.id,name:p.name,profile:profileData(p.profile),session:p.session||0,online:online(p),presence:online(p)?'ACTIVE':p.left?'LEFT':'DISCONNECTED',reservedUntil:p.reservedUntil||null,inCall:!!p.inCall,mic:p.mic,camera:p.camera,ready:p.ready,loadStatus:p.loadStatus||'',chatBlocked:!!p.chatBlocked,micBlocked:p.micBlocked,cameraAllowed:p.cameraAllowed,cameraRequested:p.cameraRequested,pttApproved:!!p.pttApproved,pttRequested:!!p.pttRequested,seatRequested:!!p.seatRequested})),serverTime:Date.now()};}
+ function snapshot(r){return {code:r.code,...interactions.view(r),...directorySettings(r),skipVoting:skipState(r,online),hostId:r.hostId,ownerId:r.ownerId||r.hostId,...partyState(r),hostReconnecting:!online(r.people.get(r.hostId)||{}),bufferTogether:r.bufferTogether!==false,pttEnabled:!!r.pttEnabled,theme:r.theme||null,guestThemes:!!r.guestThemes,autoplay:queueOrder(r)==='fifo',queueOrder:queueOrder(r),autoAdvance:r.autoAdvance!==false,capacity:r.capacity,locked:r.locked,source:r.source,sourceLikes:r.sourceLikes||[],playback:r.playback,queue:r.queue||[],people:[...r.people.values()].map(p=>({id:p.id,name:p.name,profile:profileData(p.profile),session:p.session||0,online:online(p),presence:online(p)?'ACTIVE':p.left?'LEFT':'DISCONNECTED',reservedUntil:p.reservedUntil||null,inCall:!!p.inCall,mic:p.mic,camera:p.camera,ready:p.ready,loadStatus:p.loadStatus||'',chatBlocked:!!p.chatBlocked,micBlocked:p.micBlocked,cameraAllowed:p.cameraAllowed,cameraRequested:p.cameraRequested,pttApproved:!!p.pttApproved,pttRequested:!!p.pttRequested,seatRequested:!!p.seatRequested})),serverTime:Date.now()};}
  function state(r){if(skipState(r,online).ready){const item=nextQueued(r),host=r.people.get(r.hostId);if(item&&host&&online(host)){const previous=r.source&&r.source.type!=='file'?{provider:r.source.type,videoId:r.source.videoId,url:r.source.url,title:r.source.title}:null;r.queue=r.queue.filter(q=>q.id!==item.id);resetSkipVotes(r);control.cancel(r,'The room voted to skip.');choose(r,host,{type:item.provider||'youtube',videoId:item.videoId,url:item.url,title:item.title});r.previousSource=previous;return;}}syncBuffering(r);broadcast(r,{type:'state',room:snapshot(r)});persist();}
  function ice(id){const out=[{urls:'stun:stun.l.google.com:19302'}];if(process.env.TURN_URLS&&process.env.TURN_SECRET){const username=`${Math.floor(Date.now()/1000)+86400}:${id}`;out.push({urls:process.env.TURN_URLS.split(','),username,credential:createHmac('sha1',process.env.TURN_SECRET).update(username).digest('base64')});}if(process.env.ICE_SERVERS_JSON)out.push(...JSON.parse(process.env.ICE_SERVERS_JSON));return out;}
  function welcome(p,r){const iceServers=ice(p.id);send(p.ws,{type:'welcome',id:p.id,token:p.token,room:snapshot(r),friendRequests:social.view(r,p),history:(r.history||[]).filter(m=>!m.to||m.from===p.id||m.to===p.id),iceServers,hasRelay:iceServers.some(s=>[s.urls].flat().some(u=>/^turns?:/.test(u))),searchEnabled:true});}
@@ -57,11 +59,11 @@ export function createXparty(options={}) {
   if(s.type==='file'&&storage+s.size>MAX_STORAGE){send(p.ws,{type:'error',message:'Temporary video storage is busy. Try a smaller file or YouTube.'});return false;}
   if(r.source?.type==='file')dropFile(r.source.id);
   r.source={type:s.type,id:randomUUID(),title:clean(s.title,150)||'YouTube video',owner:p.id,...(isCompanion(s)?{videoId:normalizeCompanionSource(s).videoId,url:normalizeCompanionSource(s).url}:isEmbedded(s)?{videoId:s.videoId}:s.type==='iptv'?{url:s.radio===true?publicRadioURL(s.url):publicStreamURL(s.url),...(s.radio===true?{radio:true}:{})}:s.type==='direct'?{url:publicVideoURL(s.url)}:{size:s.size,mime:clean(s.mime,80),uploaded:false})};
-  resetSkipVotes(r);r.sourceLikes=[];
+  resetSkipVotes(r);r.sourceLikes=[];r.endVote=null;
   if(s.type==='file'){storage+=s.size;files.set(r.source.id,{id:r.source.id,size:s.size,offset:0,busy:false,dir:null,path:null,code:r.code});}
   r.playback={position:0,playing:false,updatedAt:Date.now(),revision:r.playback.revision+1};for(const x of r.people.values()){x.ready=false;x.buffering=false;x.loadStatus=s.type==='file'?'Waiting for upload':'Loading';}state(r);return true;
  }
- function remove(p,kicked=false){const r=rooms.get(p.code);if(!r)return;clients.delete(p.token);r.people.delete(p.id);r.queue=(r.queue||[]).map(q=>({...q,votes:(q.votes||[]).filter(x=>x!==p.id)}));
+ function remove(p,kicked=false){const r=rooms.get(p.code);if(!r)return;clients.delete(p.token);r.people.delete(p.id);if(r.endVote)delete r.endVote.votes[p.id];r.queue=(r.queue||[]).map(q=>({...q,votes:(q.votes||[]).filter(x=>x!==p.id)}));
   if(!r.people.size){if(r.source?.type==='file')dropFile(r.source.id);attachments.clearRoom(r.code);rooms.delete(r.code);persist();return;}
   if(r.hostId===p.id){r.hostId=([...r.people.values()].find(online)||r.people.values().next().value).id;const h=r.people.get(r.hostId);h.cameraAllowed=true;h.micBlocked=false;}
   if(r.source?.owner===p.id&&r.source.type==='file'&&!r.source.uploaded){dropFile(r.source.id);r.source=null;r.playback.playing=false;}
@@ -131,7 +133,7 @@ export function createXparty(options={}) {
  });
  const control=createPartyControl({online:p=>!!p&&online(p),send,state,execute:(p,r,m)=>dispatch(p.ws,m,true),requestMs:options.requestMs??30000,lockMs:options.lockMs??10000});
  function dispatch(ws,m,approved=false){
-   const p=ws.person,r=p&&rooms.get(p.code);if(!r||r.people.get(p.id)!==p||p.ws!==ws)return;const host=p.id===r.hostId||approved;if(social.handle(r,p,m)||callSeats.handle(r,p,m))return;if(!approved&&control.handle(r,p,m))return;
+   const p=ws.person,r=p&&rooms.get(p.code);if(!r||r.people.get(p.id)!==p||p.ws!==ws)return;const host=p.id===r.hostId||approved;if(interactions.handle(r,p,m)||social.handle(r,p,m)||callSeats.handle(r,p,m))return;if(!approved&&control.handle(r,p,m))return;
    if(['skip-settings','skip-vote'].includes(m.type)){if(rate('skip:'+p.id,8,5000)&&configureSkip(r,p,m,online))state(r);return;}
    if(m.type==='room-directory'){if(updateDirectory(r,p.id,m))state(r);else send(ws,{type:'error',message:'Only the host can update the listing. Public rooms need a title.'});return;}
    if(m.type==='leave'){p.left=true;p.reservedUntil=null;control.cancel(r,'Participant left.');if(r.ownerId!==p.id){remove(p);}else{p.ws=null;p.buffering=false;p.inCall=false;p.mic=false;p.camera=false;p.ready=false;if(r.hostId===p.id){const next=[...r.people.values()].find(x=>x!==p&&online(x));if(next){r.hostId=next.id;next.cameraAllowed=true;next.micBlocked=false;}}state(r);}ws.person=null;return ws.close(1000,'Left');}
