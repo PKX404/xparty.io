@@ -18,7 +18,7 @@ export function initFullscreen({getContext,notify=()=>{},nativeVideo}){
  const handle=button('Video call · drag to move',()=>{},'fullscreen-call-move');handle.className='fullscreen-call-move';handle.setAttribute('aria-label','Move video call bubble');
  const resize=button('↘',()=>{},'fullscreen-call-resize');resize.className='fullscreen-call-resize';resize.setAttribute('aria-label','Resize video call bubble');
  const actions=document.createElement('div');actions.className='fullscreen-call-actions';
- for(const [id,label]of [['mic','Mic'],['camera','Camera'],['speaker','Speaker'],['call-seat','Call seat']]){const b=button(label,()=>$(id).click());b.dataset.mirror=id;actions.append(b);}
+ for(const [id,label]of [['mic','Mic'],['camera','Camera'],['call-seat','Call seat']]){const b=button(label,()=>$(id).click());b.dataset.mirror=id;actions.append(b);}
  const shape=button('▭',()=>{const rectangle=body.classList.toggle('fullscreen-call-rectangle');shape.setAttribute('aria-pressed',String(rectangle));shape.setAttribute('aria-label',rectangle?'Use rounded call bubble':'Use rectangular call bubble');},'fullscreen-call-shape');shape.setAttribute('aria-label','Use rectangular call bubble');shape.setAttribute('aria-pressed','false');actions.append(shape);
  call.prepend(handle);call.append(actions,resize);
  function layout(){box=clampBubble(box,{width:innerWidth,height:innerHeight});for(const [key,value]of Object.entries(box))call.style.setProperty('--bubble-'+key,value+'px');}

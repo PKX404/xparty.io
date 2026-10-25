@@ -32,12 +32,10 @@ export function initRoomDesign({getContext}) {
   const sceneTitle = node('h1', 'room-scene-title', 'Make a night of it.');
   sceneInfo.append(eyebrow, sceneTitle);
   const sceneActions = node('div', 'room-scene-actions');
-  const invite = action('Invite friends', 'room-invite-button', () => $('copy')?.click());
-  invite.setAttribute('aria-label', 'Copy room code to invite friends');
-  const people = action('People', 'room-people-button', () => peopleButton?.click());
+  const people = peopleButton;
   people.setAttribute('aria-controls', 'participants-drawer');
   people.setAttribute('aria-expanded', 'false');
-  sceneActions.append(invite, people);
+  // The single Participants control lives in the room header.
   scene.append(sceneInfo, sceneActions);
   roomElement.querySelector('.room-grid')?.before(scene);
   const tools=node('div','room-scene-tools');
@@ -107,7 +105,7 @@ export function initRoomDesign({getContext}) {
   function update() {
     if (destroyed) return;
     const {room, me} = getContext();
-    scene.hidden = !room;
+    scene.hidden = true;
     tools.hidden = !room;
     if (!room) {
       if (drawer) drawer.open = false;
@@ -123,7 +121,7 @@ export function initRoomDesign({getContext}) {
     const title = room.source?.title || 'Make a night of it.';
     if (sceneTitle.textContent !== title) sceneTitle.textContent = title;
     eyebrow.textContent = room.source ? 'WATCHING TOGETHER' : 'YOUR WATCH ROOM';
-    people.textContent = 'People · ' + online;
+    people.setAttribute('aria-label', 'Participants · ' + online);
     drawerCount.textContent = online + ' here now · ' + room.people.filter(person => person.online && person.inCall).length + ' in the call';
     for (const [index, row] of [...(memberList?.children || [])].entries()) {
       const person = room.people[index];
@@ -178,8 +176,8 @@ export function initRoomDesign({getContext}) {
   const participantHeading = roomElement.querySelector('.participant-strip h2');
   let headingButton;
   if (participantHeading) {
-    headingButton = action('', 'room-participants-label', () => peopleButton?.click());
-    headingButton.setAttribute('aria-label', 'Open participants and room permissions');
+    headingButton = node('span', 'room-participants-label');
+    headingButton.setAttribute('aria-label', 'Room occupancy');
     headingButton.append(...participantHeading.childNodes);
     participantHeading.append(headingButton);
   }

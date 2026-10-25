@@ -5,11 +5,15 @@ export function initRoomInteractions({getContext,send,notify,base,profiles,frien
  const header=node('header','mobile-room-header');header.setAttribute('aria-label','Watch room');
  for(const [id,label,glyph]of [['nav-home','Home','close'],['nav-settings','Settings','settings'],['brand','Xparty',null],['browse','Quick search and sources','search'],['people-button','Participants','people']]){
    if(id==='brand'){header.append(node('strong','mobile-room-brand','xparty'));continue;}
-   const b=button(label,()=>$(id)?.click());icon(b,glyph,label);if(id==='people-button')b.id='mobile-people';header.append(b);
+   const b=id==='people-button'?$(id):button(label,()=>$(id)?.click());icon(b,glyph,label);header.append(b);
  }$('room').prepend(header);
+ const connection=node('div','room-connection-status');connection.setAttribute('role','status');connection.hidden=true;header.after(connection);document.addEventListener('xparty:connection-status',e=>{connection.textContent=e.detail.text;connection.hidden=['connected','idle'].includes(e.detail.state);});
+ const lighting=node('p','room-lighting-status');lighting.hidden=true;lighting.setAttribute('role','status');$('watch-stage').after(lighting);
+ const frameLayer=document.querySelector('.room-ambient-layer');if(frameLayer)new MutationObserver(()=>{const source=getContext().room?.source;lighting.hidden=source?.type!=='youtube'||['native','video'].includes(frameLayer.dataset.mode);}).observe(frameLayer,{attributes:true,attributeFilter:['data-mode']});
+ const callVolume=$('call-volume'),speaker=$('speaker');speaker.classList.add('room-speaker');const speakerLabel=callVolume.closest('label');speakerLabel.prepend(speaker);
  const moreDialog=node('dialog','room-report');moreDialog.setAttribute('aria-label','Call and playback options');moreDialog.append(node('h2','','Room controls'),button('Close',()=>moreDialog.close()));moreDialog.addEventListener('click',e=>{if(e.target.closest('button'))moreDialog.close();});document.body.append(moreDialog);
  const callRow=document.querySelector('.call-seat-row'),more=button('More',()=>moreDialog.showModal(),'room-more-call');icon(more,'more','More call options');callRow.append(more);
- const compact=matchMedia('(max-width:700px)'),moved=[];
+ const compact=matchMedia('(min-width:0px)'),moved=[];
  function compactControls(){if(compact.matches){const extras=['captions-toggle','load-subtitles','previous-video','resync','back10','forward10','control-key'].map($).filter(Boolean);for(const control of [...callRow.children,...extras]){if(['call-seats','call-seat','speaker','expand-call'].includes(control.id)||control===more||control.parentElement===moreDialog)continue;const marker=document.createComment('call control');control.before(marker);moved.push([control,marker]);moreDialog.append(control);}more.hidden=false;}else{for(const [control,marker]of moved.splice(0)){marker.replaceWith(control);}more.hidden=true;moreDialog.close();}}
  compact.addEventListener('change',compactControls);compactControls();
  const pin=node('aside','chat-pinned');pin.setAttribute('aria-label','Pinned message');pin.hidden=true;
@@ -74,9 +78,9 @@ export function initRoomInteractions({getContext,send,notify,base,profiles,frien
  function updateCountdown(){const {room}=getContext(),v=room?.endVote;if(!v||ending.hidden)return;const remaining=v.deadline?Math.max(0,Math.ceil((v.deadline-(Date.now()+(room.serverTime?clockOffset:0)))/1000)):null;countdown.textContent=v.closed?'Up next':remaining!==null?'Vote next · '+remaining+'s':'Up next';}
  let clockOffset=0;setInterval(updateCountdown,1000);
  function update(){
-   const {room,me}=getContext();if(room?.code!==roomCode){roomCode=room?.code||null;muted=new Set();blocked=new Set();try{const cache=JSON.parse(sessionStorage.getItem('xparty.room-controls.'+roomCode)||'{}');muted=new Set(cache.muted||[]);blocked=new Set(cache.blocked||[]);}catch{}requested=null;controller?.abort();mini.close();if(room&&matchMedia('(max-width: 700px)').matches)conversation('call');}
-   if(!room){mini.close();ending.hidden=true;return;}clockOffset=(room.serverTime||Date.now())-Date.now();
-   const peopleCount=room.people.filter(p=>p.online).length;$('mobile-people').setAttribute('aria-label','Participants · '+peopleCount);const heading=document.querySelector('.room-participants-label');if(heading)heading.dataset.count=peopleCount+' here';
+   const {room,me}=getContext();if(room?.code!==roomCode){roomCode=room?.code||null;muted=new Set();blocked=new Set();try{const cache=JSON.parse(sessionStorage.getItem('xparty.room-controls.'+roomCode)||'{}');muted=new Set(cache.muted||[]);blocked=new Set(cache.blocked||[]);}catch{}requested=null;controller?.abort();mini.close();if(room)conversation('call');}
+   if(!room){mini.close();ending.hidden=true;connection.hidden=true;document.body.classList.remove('room-video-pinned','room-empty-video');return;}document.body.classList.toggle('room-video-pinned',!!room.source);document.body.classList.toggle('room-empty-video',!room.source);const frameMode=document.querySelector('.room-ambient-layer')?.dataset.mode;lighting.hidden=room.source?.type!=='youtube'||['native','video'].includes(frameMode);lighting.textContent='YouTube ambient colours · live frame lighting requires the Android app.';clockOffset=(room.serverTime||Date.now())-Date.now();
+   const peopleCount=room.people.filter(p=>p.online).length;$('people-button').setAttribute('aria-label','Participants · '+peopleCount);const heading=document.querySelector('.room-participants-label');if(heading)heading.dataset.count=peopleCount+' here';
    const quote=room.pinnedQuote;pin.hidden=!quote||blocked.has(quote.from);if(quote){pinText.textContent=quote.name+': '+quote.text;unpin.hidden=room.hostId!==me;}
    for(const b of $('messages').querySelectorAll('.message-pin'))b.hidden=room.hostId!==me;
    if(mini.open&&!room.people.some(p=>p.id===selected))mini.close();filterMessages();updateBallot();

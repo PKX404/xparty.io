@@ -1,3 +1,4 @@
+import {applyBranding} from '/xparty/branding.js';
 import {initWorldHome} from '/xparty/world-home.js';
 import {initRaveUI} from '/xparty/rave-ui.js';
 import {initSettingsDesign} from './settings-design.js';
@@ -5,6 +6,7 @@ import {MAX_VIDEO_BYTES,MAX_CALL_SEATS,MAX_FINITE_ROOM_CAPACITY,validRoomCapacit
 import {isCompanion,parseCompanionLink} from './companion-providers.js';
 import {initCompanion} from './companion-client.js';
 import {initProviderUI,providerName} from './provider-ui.js';
+import {createHeartbeat,retryDelay,peerLabel} from '/xparty/connection-policy.js';
 import {initRoomInteractions} from '/xparty/room-interactions.js';
 import {initRoomDesign} from './room-design.js';
 import {isEmbedded,isVideoElement,isLiveSource,parseProviderLink,createVimeoPlayer,createTwitchPlayer,createSoundCloudPlayer} from './providers.js';
@@ -27,7 +29,10 @@ import {youtubeId, targetPosition, correction} from './sync.js';
 const $ = id => document.getElementById(id);
 const MAX_FILE = MAX_VIDEO_BYTES;
 let base = (window.XPARTY_CONFIG?.backendUrl || location.origin).replace(/\/$/,'');
-let suspended=false,localPaused=false,lastServerHeard=Date.now();
+let suspended=false,localPaused=false,connectionState='idle',reconnectAttempts=0;
+const heartbeat=createHeartbeat(),peerRetries=new Map();
+function connectionStatus(state){connectionState=state;document.body.dataset.connection=state;const text=({connected:'Room connected',connecting:'Connecting to room',reconnecting:'Reconnecting to room',offline:'Offline - waiting for network',checking:'Checking room connection',idle:'Private watch rooms'})[state];$('network').lastChild.textContent=' '+text;document.dispatchEvent(new CustomEvent('xparty:connection-status',{detail:{state,text}}));}
+function scheduleReconnect(){clearTimeout(reconnectTimer);if(intentionalClose||suspended||!token)return;if(!navigator.onLine){connectionStatus('offline');return;}connectionStatus('reconnecting');reconnectTimer=setTimeout(()=>connect({type:'resume',token}),retryDelay(reconnectAttempts++));}
 let switching=false;const attachmentUrls=new Set();
 let socket, me, token, room, preview = false, intentionalClose = false, reconnectTimer, connectTimer;
 let iceServers=[], peers=new Map(), localStream=new MediaStream(), yt, ytReady=false, ytPromise;
@@ -65,7 +70,7 @@ function warmService(){
 // One bounded warm-up per visit; no idle keep-alive traffic.
 if(base!==location.origin)warmService().catch(()=>{});
 async function connect(action) {
- if(preparingConnection)return;
+ if(preparingConnection||switching)return;
  if(!room&&action.type!=='resume'){preparingConnection=true;$('create').disabled=true;$('join-button').disabled=true;serviceStatus.hidden=false;serviceStatus.textContent=t('Connecting to the party server… First connection may take about a minute.');
  try{await warmService();}catch(error){toast(error.message);return;}finally{preparingConnection=false;serviceStatus.hidden=true;$('create').disabled=false;$('join-button').disabled=false;}}
 
@@ -76,10 +81,10 @@ async function connect(action) {
   const oldSocket=socket, switchingRoom=!!room&&['create','join'].includes(action.type);
   switching=switchingRoom;
   if(!switchingRoom&&socket?.readyState<2)socket.close();
-  const ws=new WebSocket(url);if(!switchingRoom)socket=ws;
-  connectTimer=setTimeout(()=>{if(ws.readyState===WebSocket.CONNECTING)ws.close();toast('The room service did not respond. Check deployment and try again.');},15000);
-  ws.onopen=()=>{lastServerHeard=Date.now();bestRTT=Infinity;clearTimeout(connectTimer);ws.send(JSON.stringify(action));ping();};
-  ws.onmessage=e=>{if(ws===socket)lastServerHeard=Date.now();try{const message=JSON.parse(e.data);
+  const ws=new WebSocket(url);let welcomed=false;connectionStatus(action.type==='resume'?'reconnecting':'connecting');if(!switchingRoom)socket=ws;
+  const handshakeTimer=setTimeout(()=>{if(!welcomed&&ws.readyState<2){ws.close(4001,'Room handshake timeout');if(!token)toast('The room service did not respond. Try again.');}},15000);connectTimer=handshakeTimer;
+  ws.onopen=()=>{if(ws!==socket&&!switchingRoom){ws.close();return;}heartbeat.heard();bestRTT=Infinity;ws.send(JSON.stringify(action));if(ws===socket)ping();};
+  ws.onmessage=e=>{if(ws!==socket&&!switchingRoom)return;if(ws===socket){heartbeat.heard();if(welcomed&&connectionState==='checking')connectionStatus('connected');}try{const message=JSON.parse(e.data);if(message.type==='welcome'){welcomed=true;clearTimeout(handshakeTimer);reconnectAttempts=0;connectionStatus('connected');}
     if(switchingRoom&&ws!==socket){
       if(message.type==='welcome'){socket=oldSocket;leave(true);socket=ws;intentionalClose=false;switching=false;}
       else if(message.type==='error'||message.type==='resume-failed'){switching=false;clearTimeout(connectTimer);ws.close();toast(message.message||'Unable to join this room.');$('create').disabled=false;$('join-button').disabled=false;return;}
@@ -88,10 +93,9 @@ async function connect(action) {
     handle(message);}catch(error){console.error('Room event failed',error);toast('An action failed. Please retry.');}};
   ws.onerror=()=>{if(!room){$('setup-notice').hidden=false;toast('Unable to reach the room service. The portal needs a live backend.');}};
   ws.onclose=e=>{
-    clearTimeout(connectTimer);$('create').disabled=false;$('join-form').querySelector('button').disabled=false;
-    if(ws!==socket){switching=false;return;}
+    clearTimeout(handshakeTimer);if(ws!==socket){if(switchingRoom)switching=false;return;}$('create').disabled=false;$('join-form').querySelector('button').disabled=false;
     if(e.code===4000){const saved=readSession();leave(false);if(saved)try{localStorage.setItem(SESSION,JSON.stringify(saved));}catch{}toast("This session was opened in another connection.");return;}
-    if(!intentionalClose && !suspended && token){notice('Connection interrupted. Reconnecting to your room…');reconnectTimer=setTimeout(()=>connect({type:'resume',token}),1800);}
+    if(!intentionalClose && !suspended && token){scheduleReconnect();}
     else if(!intentionalClose&&!suspended){$('setup-notice').hidden=false;}
   };
 }
@@ -105,7 +109,7 @@ function handle(m) {
   if(m.type==='call-seat-status'){toast(({pending:'Call seat requested. Waiting for the host.',approved:'Seat approved. You can turn on your camera or microphone.',declined:'The host declined your seat request.'})[m.status]);return;}
   if(m.type==='moderation'){toast(({mute:'The host muted your microphone.','allow-mic':'You can turn on your microphone again.','offer-mic':'The host offered you a microphone. Tap Mic when you are ready.','camera-off':'The host turned off your camera.','approve-camera':'Camera approved. Tap Camera to turn it on.','deny-camera':'Your camera request was declined.'})[m.action]);return;}
   if(m.type==='profile-details'){window.dispatchEvent(new CustomEvent('xparty:profile-details',{detail:m}));return;}
-  if(m.type==='welcome') {setTimeout(showRoomGuide,600);
+  if(m.type==='welcome') {connectionStatus('connected');setTimeout(showRoomGuide,600);
     for(const p of peers.values())closePeer(p);peers.clear();me=m.id;token=m.token;iceServers=m.iceServers;room=m.room;saveSession({token,base,code:m.room.code,id:m.id});$('active-room-banner').hidden=true;
     $('lobby').hidden=true;$('room').hidden=false;$('return-room').hidden=true;$('demo-banner').hidden=true;
     document.documentElement.removeAttribute('data-restoring');$('setup-notice').hidden=true;$('network').lastChild.textContent=' Room connected';
@@ -118,7 +122,7 @@ function handle(m) {
   if(m.type==='state') {updateRoom(m.room);return;}
   if(m.type==='playback' || m.type==='anchor') {
     if(!room || m.sourceId!==room.source?.id)return;
-    const newCommand=m.playback.revision!==activePlayback?.revision;room.playback=m.playback;activePlayback=m.playback;if(newCommand&&!localPaused&&room.source?.type==='youtube'){clearTimeout(bufferTimer);bufferReported=false;if(m.playback.playing){if(!ytReady)reportBuffer(true);else if(yt.getPlayerState()===3)bufferTimer=setTimeout(()=>reportBuffer(true),1200);}}applyPlayback(newCommand||m.resync===true);ambient.update();return;
+    const newCommand=m.playback.revision!==activePlayback?.revision;room.playback=m.playback;activePlayback=m.playback;if(newCommand&&!localPaused&&usesEmbed(room.source)){clearTimeout(bufferTimer);bufferReported=false;if(m.playback.playing){if(!ytReady)reportBuffer(true);else if(yt.getPlayerState()===3)bufferTimer=setTimeout(()=>reportBuffer(true),1200);}}applyPlayback(newCommand||m.resync===true);ambient.update();return;
   }
   if(m.type==='reaction'){toast(m.name+' '+m.emoji);return;}
   if(m.type==='friend-state'){friendRequests=m.requests||[];renderRoomFriends();if(room){renderPeople();renderRequestNotices();}if(friendRequests.some(q=>q.to===me&&q.status==='pending'))toast('A friend request is waiting in Friends.');return;}if(m.type==='poll-update'){for(const e of document.querySelectorAll('[data-poll-id]'))if(e.dataset.pollId===m.poll.id)renderPoll(e,m.poll);return;}if(m.type==='chat'){addMessage(m);return;}if(['member-report','report-sent'].includes(m.type)){roomInteractions?.onEvent(m);return;}
@@ -134,7 +138,7 @@ function updateRoom(next) {
   $('host-note').textContent=room.hostId===me?'You control this party. Change modes from the key menu.':'Playback follows the mode selected by your host.';
   const self=room.people.find(p=>p.id===me);$('message-input').disabled=!!self?.chatBlocked;$('message-input').placeholder=self?.chatBlocked?'Chat paused by the host':'Write a message…';let removed=false;for(const track of localStream.getTracks()){if(!self?.inCall||(track.kind==='audio'&&self?.micBlocked)||(track.kind==='video'&&!host&&!self?.cameraAllowed)){track.stop();localStream.removeTrack(track);removed=true;}}if(removed){$('mic').setAttribute('aria-pressed',localStream.getAudioTracks().some(t=>t.enabled&&t.readyState==='live'));$('camera').setAttribute('aria-pressed',localStream.getVideoTracks().some(t=>t.enabled&&t.readyState==='live'));updateMedia();}
   renderQueue();renderPartyControls();memberProfiles.update();updateDiscovery(preview?null:room,me);skipVoting.update();subtitles.update();
-  for(const [id,p]of peers) {const person=room.people.find(x=>x.id===id);if(!self?.inCall||!person?.inCall||!person?.online||p.session!==person.session){closePeer(p);peers.delete(id);}}
+  for(const [id,p]of peers) {const person=room.people.find(x=>x.id===id);if(!self?.inCall||!person?.inCall||(!person.online&&person.reservedUntil<=Date.now())||p.session!==person.session){closePeer(p);peers.delete(id);}}
   if(!preview)for(const person of room.people)if(self?.inCall&&person.inCall&&person.id!==me && person.online)ensurePeer(person.id);
   renderPeople();renderMembers();$('call-seat').setAttribute('aria-pressed',String(!!self?.inCall));$('call-seat').textContent=t(self?.inCall?'Leave call':'Join call');icon($('call-seat'),self?.inCall?'hangup':'phone',self?.inCall?'Drop call seat':self?.seatRequested?'Cancel seat request':'Take call seat');$('call-seats').textContent=room.people.filter(p=>p.inCall&&p.online).length+'/'+MAX_CALL_SEATS;$('mic').disabled=!self?.inCall;$('camera').disabled=!self?.inCall;if(recipient&&!room.people.some(p=>p.id===recipient.id))setRecipient(null);
   if((room.source?.id||null)!==sourceId) applySource(room.source);
@@ -154,7 +158,7 @@ function renderPeople() {
     tile.querySelector('.host-crown')?.remove();if(person.id===room.hostId){const crown=document.createElement('span');crown.className='host-crown';crown.setAttribute('role','img');icon(crown,'crown',t('Host'));tile.querySelector('.person-label>span').prepend(crown);}
     let indicators=tile.querySelector('.media-status');if(!indicators){indicators=document.createElement('span');indicators.className='media-status';tile.querySelector('.person-label').append(indicators);}indicators.replaceChildren();for(const [name,on]of [['mic',person.mic],['camera',person.camera]]){const mark=document.createElement('span');icon(mark,name,t(name==='mic'?(on?'Mic on':'Mic off'):(on?'Camera on':'Camera off')));mark.setAttribute('role','img');mark.classList.toggle('off',!on);indicators.append(mark);}
     const p=peers.get(person.id), local=person.id===me;indicators.hidden=local;
-    const state=local?'Here':!person.online?'Reconnecting':p?.pc.connectionState==='connected'?'Connected':preview?'Preview':'Connecting';
+    const state=peerLabel({local,online:person.online,inCall:person.inCall,signaling:connectionState,peerState:p?.pc.connectionState,preview});
     tile.querySelector('.person-label small').textContent=t(state);
     const video=tile.querySelector('video');const stream=local?localStream:p?.stream;
     if(stream && video.srcObject!==stream){video.srcObject=stream;video.play().catch(()=>{});}
@@ -163,16 +167,16 @@ function renderPeople() {
     if(local){let controls=tile.querySelector('.local-controls');if(!controls){controls=document.createElement('div');controls.className='local-controls';tile.append(controls);}controls.append($('mic'),$('camera'),$('camera-flip'));tile.classList.add('self');tile.dataset.facing=cameraFacing;}
     tile.classList.toggle('camera-active',person.camera);ensureParticipantPip(tile,person);
     tile.querySelector('.moderation')?.remove();
-    if(!local){let friend=tile.querySelector('.tile-friend');if(!friend){friend=actionIcon('Add '+person.name+' as friend','person-add',()=>send('friend-request',{target:person.id}));friend.classList.add('tile-friend');tile.querySelector('.person-label').append(friend);}roomFriendAction(person,friend);}
+    tile.querySelector('.tile-friend')?.remove();
     if(room.source?.type==='file')tile.querySelector('.person-label small').textContent+=' · '+(person.ready?'Video ready':person.loadStatus||'Loading');
   }
-  if(people.length===1){let empty=container.querySelector('[data-id="waiting"]');if(!empty){empty=document.createElement('div');empty.className='participant';empty.dataset.id='waiting';empty.innerHTML='<span class="avatar">+</span><div class="person-label"><span>Your person goes here</span><small>Share the room code</small></div>';container.append(empty);}}
-  const watchers=$('watching-members');watchers.replaceChildren();for(const person of room.people.filter(p=>p.online&&!p.inCall&&p.id!==me)){const item=document.createElement('span');item.textContent=person.name;item.append(actionIcon('Add '+person.name+' as friend','person-add',()=>send('friend-request',{target:person.id})));watchers.append(item);}
+  for(const [i,tile]of [...container.children].entries()){tile.classList.toggle('primary-call-tile',i<2);tile.classList.toggle('bubble-call-tile',i>=2);}
+  const watchers=$('watching-members');watchers.replaceChildren();for(const person of room.people.filter(p=>p.online&&!p.inCall&&p.id!==me)){const item=document.createElement('span');item.textContent=person.name;item.setAttribute('aria-label',person.name+' is watching');watchers.append(item);}
   callPanel.dataset.active=String(people.filter(p=>p.camera).length);
   swapCamera.disabled=people.length<2;container.dataset.active=String(people.filter(p=>p.camera).length);container.dataset.count=String(people.length);container.classList.toggle('duo',people.length===2);$('camera-flip').disabled=!localStream.getVideoTracks().some(t=>t.readyState==='live');
   if(!callControlTimer)revealCallControls();
   const connected=[...peers.values()].filter(p=>p.pc.connectionState==='connected').length;
-  $('call-status').textContent=preview?'Design preview — no camera or microphone is active.':peers.size?`${connected}/${peers.size} peer connections ready · Your mic ${localStream.getAudioTracks().some(t=>t.enabled)?'is on':'is off'}`:'Share the code, then turn on your mic or camera.';
+  $('call-status').textContent=preview?'Design preview — no camera or microphone is active.':peers.size?`${connected}/${peers.size} peer connections ready · Your mic ${localStream.getAudioTracks().some(t=>t.enabled)?'is on':'is off'}`:'Your microphone and camera are off.';
 }
 function ensurePeer(id) {
   if(preview || id===me || !room?.people.some(p=>p.id===id&&p.inCall)||!room?.people.some(p=>p.id===me&&p.inCall))return;
@@ -181,7 +185,7 @@ function ensurePeer(id) {
   const p={id,pc,session:room.people.find(x=>x.id===id)?.session,stream:new MediaStream(),queue:Promise.resolve(),candidates:[],initiator:me.localeCompare(id)<0,sending:null,receive:null};peers.set(id,p);
   pc.onicecandidate=e=>{if(e.candidate)send('signal',{to:id,signal:{candidate:e.candidate}});};
   pc.ontrack=e=>{if(!p.stream.getTracks().some(t=>t.id===e.track.id))p.stream.addTrack(e.track);if(e.track.kind==='audio')e.track.onunmute=()=>attachRemoteAudio(p);renderPeople();};
-  pc.onconnectionstatechange=()=>{renderPeople();if(pc.connectionState==='connected'){clearTimeout(p.recoveryTimer);p.recoveryAttempts=0;}else if(['failed','disconnected'].includes(pc.connectionState))schedulePeerRecovery(p);};
+  pc.onconnectionstatechange=()=>{renderPeople();if(pc.connectionState==='connected'){clearTimeout(p.recoveryTimer);p.recoveryAttempts=0;peerRetries.delete(p.id);}else if(['failed','disconnected'].includes(pc.connectionState))schedulePeerRecovery(p);};
   p.recoveryTimer=setTimeout(()=>{if(pc.connectionState!=='connected')recoverPeer(p);},12000);
   pc.oniceconnectionstatechange=()=>{if(['failed','disconnected'].includes(pc.iceConnectionState))schedulePeerRecovery(p);};
   pc.ondatachannel=e=>setupChannel(p,e.channel);
@@ -195,19 +199,20 @@ function ensurePeer(id) {
 function schedulePeerRecovery(p){
   clearTimeout(p.recoveryTimer);
   if(peers.get(p.id)!==p||!['failed','disconnected','connecting','new'].includes(p.pc.connectionState))return;
-  p.recoveryTimer=setTimeout(()=>recoverPeer(p),p.pc.connectionState==='disconnected'?4000:800);
+  const attempts=peerRetries.get(p.id)||0;p.recoveryTimer=setTimeout(()=>recoverPeer(p),Math.max(p.pc.connectionState==='disconnected'?4000:800,retryDelay(attempts)));
 }
 function recoverPeer(p,force=false){
   if(peers.get(p.id)!==p||!room?.people.some(x=>x.id===p.id&&x.online&&x.inCall)||socket?.readyState!==WebSocket.OPEN)return;
   if(!force&&p.pc.connectionState==='connected')return;
   if(!force&&Date.now()-(p.lastRecovery||0)<3000){schedulePeerRecovery(p);return;}
-  p.lastRecovery=Date.now();p.recoveryAttempts=(p.recoveryAttempts||0)+1;
-  if(p.initiator&&p.recoveryAttempts>=3){send('signal',{to:p.id,signal:{reset:true}});closePeer(p);peers.delete(p.id);ensurePeer(p.id);renderPeople();return;}
+  p.lastRecovery=Date.now();p.recoveryAttempts=(peerRetries.get(p.id)||0)+1;peerRetries.set(p.id,p.recoveryAttempts);
+  if(p.initiator&&p.recoveryAttempts%3===0){send('signal',{to:p.id,signal:{reset:true}});closePeer(p);peers.delete(p.id);ensurePeer(p.id);renderPeople();return;}
   if(p.initiator)p.pc.restartIce();else send('signal',{to:p.id,signal:{restart:true}});
   clearTimeout(p.recoveryTimer);
-  p.recoveryTimer=setTimeout(()=>{if(p.pc.connectionState!=='connected')recoverPeer(p);},Math.min(30000,4000*2**Math.min(p.recoveryAttempts,3)));
+  p.recoveryTimer=setTimeout(()=>{if(p.pc.connectionState!=='connected')recoverPeer(p);},retryDelay(p.recoveryAttempts));
 }
-window.addEventListener('online',()=>{ping();for(const p of peers.values())recoverPeer(p,true);});
+window.addEventListener('online',()=>{heartbeat.resume();if(token&&(!socket||socket.readyState>=2)){clearTimeout(reconnectTimer);connect({type:'resume',token});}else{if(room)connectionStatus('checking');ping();}for(const p of peers.values())recoverPeer(p,true);});
+window.addEventListener('offline',()=>{heartbeat.pause();clearTimeout(reconnectTimer);if(room)connectionStatus('offline');});
 async function replaceTracks(p) {
   if(p.pc.signalingState==='closed')return;
   for(const t of p.pc.getTransceivers()) {
@@ -384,7 +389,7 @@ function showMentions(){const value=$('message-input').value;const match=value.m
 function actionIcon(label,shape,action){const b=document.createElement('button');b.type='button';b.className='icon-control';icon(b,shape,t(label));b.onclick=action;return b;}
 function renderMembers(){const container=$('member-list');container.replaceChildren();for(const person of room.people){
   const row=document.createElement('div');row.className='member-row';const label=document.createElement('span');label.textContent=person.name+(person.online?'':' · Away');if(person.id===room.hostId){const crown=document.createElement('span');crown.className='host-crown';crown.setAttribute('role','img');icon(crown,'crown',t('Host'));label.prepend(crown);}row.append(label);
-  if(person.id!==me){row.append(actionIcon('Add '+person.name+' as friend','person-add',()=>send('friend-request',{target:person.id})));row.append(actionIcon('Message '+person.name,'message',()=>{setRecipient(person);conversation('both');$('return-room').click();members.open=false;$('message-input').focus();}));
+  if(person.id!==me){row.append(actionIcon('Message '+person.name,'message',()=>{setRecipient(person);conversation('both');$('return-room').click();members.open=false;$('message-input').focus();}));
     if(me===room.hostId){const tools=document.createElement('div');tools.className='member-permissions';tools.hidden=true;
       row.append(actionIcon('Permissions for '+person.name,'settings',()=>{tools.hidden=!tools.hidden;keepMembers();}));
       for(const [title,on,yes,no]of [['Chat',!person.chatBlocked,'allow-chat','block-chat'],['Mic',!person.micBlocked,'allow-mic','mute'],['Camera',!!person.cameraAllowed,'approve-camera','camera-off']]){const label=document.createElement('label');label.className='switch-row';label.textContent=title;const input=document.createElement('input');input.type='checkbox';input.setAttribute('role','switch');input.checked=on;input.onchange=()=>send('moderate',{target:person.id,action:input.checked?yes:no});label.append(input);tools.append(label);}
@@ -400,7 +405,7 @@ function updateTheatre(){$('focus-call').setAttribute('aria-pressed',document.bo
 function setTheatre(enabled){document.body.dataset.view=viewMode;document.body.classList.toggle('cinema',enabled);document.body.classList.remove('browsing');if(enabled){vcVisible=true;chatVisible=false;}$('room-menu').open=false;updateTheatre();if(!enabled){unread=0;updateUnread();}}
 function leave(notify=true){
   providerLoad?.abort();companion.disconnect();
-  localPaused=false;
+  localPaused=false;reconnectAttempts=0;peerRetries.clear();connectionStatus('idle');
   $('room-menu').open=false;document.querySelector('.member-list').open=false;
   if(notify&&room?.ownerId===me)sessionStorage.setItem('xparty-owner-return',JSON.stringify({code:room.code,token,base}));else if(!notify)sessionStorage.removeItem('xparty-owner-return');
   intentionalClose=true;clearTimeout(reconnectTimer);clearTimeout(connectTimer);if(notify&&socket?.readyState===WebSocket.OPEN)socket.send(JSON.stringify({type:'leave'}));socket?.close();
@@ -697,7 +702,8 @@ document.addEventListener('visibilitychange',()=>{if(document.hidden&&bufferRepo
 
 
 
-setInterval(()=>{if(!document.hidden&&!suspended&&room&&socket?.readyState===WebSocket.OPEN&&Date.now()-lastServerHeard>15000)socket.close(4001,'Heartbeat recovery');},3000);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)heartbeat.pause();else{heartbeat.resume();if(room&&navigator.onLine){ping();if(socket?.readyState>=2)scheduleReconnect();}}});
+setInterval(()=>{if(document.hidden||suspended||!room||socket?.readyState!==WebSocket.OPEN||!navigator.onLine)return;const action=heartbeat.poll();if(action==='probe'){connectionStatus('checking');ping();}else if(action==='reconnect')socket.close(4001,'Heartbeat response timeout');},3000);
 
 function roomFriendAction(person,button){const request=friendRequests.find(q=>[q.from,q.to].includes(person.id)&&[q.from,q.to].includes(me)&&q.status!=='declined');button.disabled=false;
  if(request?.status==='accepted'){icon(button,'message',t('Message')+' '+person.name);button.onclick=()=>{setRecipient(person);conversation('chat');};}
@@ -797,8 +803,8 @@ initDiscovery({base,send,join:code=>{if(room&&room.code!==code){toast('Leave you
 const subtitles=initSubtitles({getContext:()=>({room,video:filePlayer}),onLoaded:()=>{captionsEnabled=true;applyCaptions();},notify:toast});
 
 // Visible playback reports support room-scoped shared watching history.
-setInterval(()=>{if(room&&!preview)send('watch-heartbeat',{sourceId,active:!document.hidden&&!localPaused&&isPlaying()});},3000);
-window.addEventListener('pagehide',()=>{if(room&&!preview)send('watch-heartbeat',{sourceId,active:false});});
+setInterval(()=>{if(room&&!preview&&socket?.readyState===WebSocket.OPEN)send('watch-heartbeat',{sourceId,active:!document.hidden&&!localPaused&&isPlaying()});},3000);
+window.addEventListener('pagehide',()=>{if(room&&!preview&&socket?.readyState===WebSocket.OPEN)send('watch-heartbeat',{sourceId,active:false});});
 providerUI=initProviderUI({getContext:()=>({room,me}),companion,base});
 roomDesign=initRoomDesign({getContext:()=>({room,me})});
 roomInteractions=initRoomInteractions({getContext:()=>({room,me,token}),send,notify:toast,base,profiles:memberProfiles,friendAction:roomFriendAction,refreshAudio:()=>{for(const p of peers.values())attachRemoteAudio(p);},conversation,icon});
@@ -812,3 +818,5 @@ initWorldHome();
 window.addEventListener('xparty:native-selection',()=>{if(navigator.userAgent.includes('XpartyAndroid/'))setTimeout(()=>ambient.update(),0);});
 
 window.addEventListener('xparty:profile-saved',e=>setEntryNickname(e.detail.display_name));
+
+applyBranding();
